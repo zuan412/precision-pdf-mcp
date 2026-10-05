@@ -161,9 +161,10 @@ class HPEEngine:
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples).convert("L")
         arr = np.array(img)
 
-        dark = (arr < 185).astype(np.uint8)
+        dark = (arr < 205).astype(np.int32)
         min_pixels = int(min_width_pt * scale)
         h, w = dark.shape
+        pw = page.rect.width
 
         detected_lines = []
         for y in range(int(60 * scale), h - int(30 * scale)):
@@ -172,13 +173,19 @@ class HPEEngine:
             starts = np.where(diff == 1)[0]
             ends = np.where(diff == -1)[0]
             for s, e in zip(starts, ends):
-                length = e - s
-                if length >= min_pixels:
+                length = (e - s) / scale
+                x0_pt = s / scale
+                x1_pt = e / scale
+                # Filter answer lines: must be inside margins and not full-page banner
+                if (length >= min_width_pt and
+                    length < (pw * 0.82) and
+                    x0_pt >= 35.0 and
+                    x1_pt <= (pw - 25.0)):
                     detected_lines.append({
                         "y": y / scale,
-                        "x0": s / scale,
-                        "x1": e / scale,
-                        "width": length / scale
+                        "x0": x0_pt,
+                        "x1": x1_pt,
+                        "width": length
                     })
 
         merged = []
@@ -421,6 +428,16 @@ class HPEEngine:
             elif slot_key.startswith("circle_word") or slot_key.startswith("circle_option"):
                 self._handle_circle_operation(page, answer_val)
                 continue
+            elif slot_key.startswith("tick_") or slot_key.startswith("check_"):
+                self._handle_tick_operation(page, answer_val)
+                continue
+            elif slot_key.startswith("custom_text"):
+                self._handle_custom_text(page, answer_val)
+                continue
+
+            if isinstance(answer_val, dict) and ("y" in answer_val or "baseline_y" in answer_val) and "text" in answer_val:
+                self._handle_custom_text(page, answer_val)
+                continue
 
             if slot_key not in slot_catalog:
                 continue
@@ -523,13 +540,17 @@ class HPEEngine:
                 rect = matches[0]
                 page.draw_line(fitz.Point(rect.x0, rect.y1 + 1.2), fitz.Point(rect.x1, rect.y1 + 1.2), color=color, width=width)
         elif isinstance(target_info, dict):
-            word = target_info.get("word")
-            hint_y = target_info.get("hint_y")
-            clip = fitz.Rect(target_info["clip"]) if "clip" in target_info else None
-            matches = page.search_for(word.strip(), clip=clip)
-            if matches:
-                rect = matches[0] if hint_y is None else min(matches, key=lambda r: abs(r.y0 - hint_y))
-                page.draw_line(fitz.Point(rect.x0, rect.y1 + 1.2), fitz.Point(rect.x1, rect.y1 + 1.2), color=color, width=width)
+            if "bbox" in target_info:
+                b = target_info["bbox"]
+                page.draw_line(fitz.Point(b[0], b[3] + 1.2), fitz.Point(b[2], b[3] + 1.2), color=color, width=width)
+            else:
+                word = target_info.get("word")
+                hint_y = target_info.get("hint_y")
+                clip = fitz.Rect(target_info["clip"]) if "clip" in target_info else None
+                matches = page.search_for(word.strip(), clip=clip)
+                if matches:
+                    rect = matches[0] if hint_y is None else min(matches, key=lambda r: abs(r.y0 - hint_y))
+                    page.draw_line(fitz.Point(rect.x0, rect.y1 + 1.2), fitz.Point(rect.x1, rect.y1 + 1.2), color=color, width=width)
 
     def _handle_circle_operation(self, page, target_info: Any):
         """Draws a smooth vector ellipse around target word or option letter."""
@@ -551,6 +572,13 @@ class HPEEngine:
                 rx = float(target_info.get("rx", 7.0))
                 ry = float(target_info.get("ry", 6.0))
                 page.draw_oval(fitz.Rect(cx - rx, cy - ry, cx + rx, cy + ry), color=color, width=width)
+            elif "bbox" in target_info:
+                b = target_info["bbox"]
+                cx = (b[0] + b[2]) / 2.0
+                cy = (b[1] + b[3]) / 2.0
+                rx = ((b[2] - b[0]) / 2.0) + float(target_info.get("pad_x", 4.0))
+                ry = ((b[3] - b[1]) / 2.0) + float(target_info.get("pad_y", 3.0))
+                page.draw_oval(fitz.Rect(cx - rx, cy - ry, cx + rx, cy + ry), color=color, width=width)
             else:
                 word = target_info.get("word", "")
                 clip = fitz.Rect(target_info["clip"]) if "clip" in target_info else None
@@ -562,6 +590,37 @@ class HPEEngine:
                     rx = (rect.width / 2.0) + float(target_info.get("pad_x", 4.0))
                     ry = (rect.height / 2.0) + float(target_info.get("pad_y", 3.0))
                     page.draw_oval(fitz.Rect(cx - rx, cy - ry, cx + rx, cy + ry), color=color, width=width)
+
+    def _handle_tick_operation(self, page, tick_info: Any):
+        """Draws a crisp vector checkmark at (cx, cy)."""
+        color = (0.0, 0.2, 0.6)
+        width = 1.6
+        if isinstance(tick_info, dict):
+            cx = float(tick_info.get("cx", 0))
+            cy = float(tick_info.get("cy", 0))
+            p1 = fitz.Point(cx - 3.5, cy + 0.5)
+            p2 = fitz.Point(cx - 1.0, cy + 3.5)
+            p3 = fitz.Point(cx + 4.5, cy - 4.0)
+            page.draw_line(p1, p2, color=color, width=width)
+            page.draw_line(p2, p3, color=color, width=width)
+
+    def _handle_custom_text(self, page, text_info: Any):
+        """Places text at an exact custom position with baseline snap."""
+        if isinstance(text_info, dict):
+            text = str(text_info.get("text", "")).strip()
+            x = float(text_info.get("x", text_info.get("x0", 0)))
+            y = float(text_info.get("y", text_info.get("baseline_y", 0)))
+            fontsize = float(text_info.get("fontsize", 9.5))
+            fontname = str(text_info.get("fontname", "helv"))
+            color = tuple(text_info.get("color", (0.0, 0.2, 0.6)))
+            align = text_info.get("align", "left")
+            if align == "center":
+                calc_len = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+                x = x - (calc_len / 2.0)
+            elif align == "line":
+                y = y - 1.2
+                x = x + 2.0
+            page.insert_text(fitz.Point(x, y), text, fontsize=fontsize, fontname=fontname, color=color)
 
     # -------------------------------------------------------------------------
     # 4. Clean Final Verification Renderer
