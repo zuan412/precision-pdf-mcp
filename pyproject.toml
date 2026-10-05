@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "precision-pdf-mcp"
+version = "0.1.0"
+description = "Pixel-perfect PDF form and worksheet filling for AI agents using Virtual Excel Matrix & Set-of-Marks baseline snapping."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Nguyen Van Zuan" }
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "pdf",
+    "precision-pdf",
+    "form-filling",
+    "llm-tools",
+    "claude-desktop",
+    "cursor"
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Topic :: Software Development :: Libraries :: Python Modules"
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "pymupdf>=1.24.0",
+    "pdfplumber>=0.11.0",
+    "pillow>=10.0.0",
+    "numpy>=1.24.0"
+]
+
+[project.scripts]
+precision-pdf = "precision_pdf.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/precision_pdf"]
