@@ -87,7 +87,7 @@ pip install precision-pdf-mcp
 
 ### Method 3: From Source (Local Development)
 ```bash
-git clone https://github.com/your-username/precision-pdf-mcp.git
+git clone https://github.com/zuan412/precision-pdf-mcp.git
 cd precision-pdf-mcp
 pip install -e .
 ```

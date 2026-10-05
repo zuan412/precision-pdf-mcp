@@ -44,5 +44,9 @@ dependencies = [
 [project.scripts]
 precision-pdf = "precision_pdf.server:main"
 
+[project.urls]
+Homepage = "https://github.com/zuan412/precision-pdf-mcp"
+Repository = "https://github.com/zuan412/precision-pdf-mcp"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/precision_pdf"]
