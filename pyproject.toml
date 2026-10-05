@@ -10,7 +10,7 @@ readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"
 authors = [
-    { name = "Nguyen Van Zuan" }
+    { name = "zuan412" }
 ]
 keywords = [
     "mcp",
