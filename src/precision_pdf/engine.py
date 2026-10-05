@@ -24,7 +24,17 @@ class HPEEngine:
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
         self.pdf_path = os.path.abspath(pdf_path)
-        self.temp_dir = temp_dir or os.environ.get("PRECISION_PDF_TEMP_DIR") or os.path.join(tempfile.gettempdir(), "precision_pdf")
+        if temp_dir:
+            self.temp_dir = temp_dir
+        elif os.environ.get("PRECISION_PDF_TEMP_DIR"):
+            self.temp_dir = os.environ.get("PRECISION_PDF_TEMP_DIR")
+        else:
+            pdf_drive = os.path.splitdrive(self.pdf_path)[0]
+            agent_temp = os.path.join(pdf_drive if pdf_drive else "D:", ".agent_temp", "scratch")
+            if os.path.exists(agent_temp):
+                self.temp_dir = agent_temp
+            else:
+                self.temp_dir = os.path.dirname(self.pdf_path)
         os.makedirs(self.temp_dir, exist_ok=True)
 
     # -------------------------------------------------------------------------
@@ -489,7 +499,9 @@ class HPEEngine:
             self._inject_single_slot(page, slot, text, fontname, fontsize, color)
 
         # Atomic In-Place Save
-        fd, temp_file = tempfile.mkstemp(suffix=".pdf", dir=self.temp_dir)
+        target_dir = os.path.dirname(target_out)
+        os.makedirs(target_dir, exist_ok=True)
+        fd, temp_file = tempfile.mkstemp(suffix=".pdf", dir=target_dir)
         os.close(fd)
 
         doc.save(temp_file)
