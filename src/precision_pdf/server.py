@@ -121,7 +121,17 @@ def hpe_render_clean_verify(pdf_path: str, page_number: int, dpi: int = 150) -> 
 
 @server.tool()
 def hpe_inspect_geometry(pdf_path: str, page_number: int) -> str:
-    """Backward compatibility alias for hpe_inspect_virtual_grid."""
+    """
+    Inspect the geometric layout and detected answer blanks of a PDF page.
+    Backward-compatible alias for hpe_inspect_virtual_grid.
+
+    Args:
+      pdf_path: Absolute or relative filesystem path to the target PDF document.
+      page_number: 1-based index of the PDF page to analyze (e.g. 1 for the first page).
+
+    Returns:
+      JSON string containing the inspector image path and the catalog of detected blanks.
+    """
     return hpe_inspect_virtual_grid(pdf_path=pdf_path, page_number=page_number)
 
 
@@ -132,7 +142,19 @@ def hpe_snap_fill(
     operations_json: str,
     output_path: Optional[str] = None
 ) -> str:
-    """Backward compatibility alias for hpe_fill_slots."""
+    """
+    Execute baseline-snapped text injection and option marking operations on a PDF page.
+    Backward-compatible alias for hpe_fill_slots.
+
+    Args:
+      pdf_path: Absolute or relative filesystem path to the PDF document to modify.
+      page_number: 1-based index of the target page (e.g. 1).
+      operations_json: JSON string with operations or slot-to-answer mappings (e.g. '{"S01": "answer"}').
+      output_path: Optional destination path for the modified PDF. If omitted, safely overwrites the original.
+
+    Returns:
+      JSON string with operation status, output file path, and filled count.
+    """
     try:
         data = json.loads(operations_json)
         if isinstance(data, dict):
@@ -156,8 +178,20 @@ def hpe_snap_fill(
 
 @server.tool()
 def hpe_render_verify(pdf_path: str, page_number: int, dpi: int = 150) -> str:
-    """Backward compatibility alias for hpe_render_clean_verify."""
+    """
+    Render a clean, high-resolution raster image of the filled PDF page for visual verification.
+    Backward-compatible alias for hpe_render_clean_verify.
+
+    Args:
+      pdf_path: Absolute or relative path to the completed PDF file.
+      page_number: 1-based index of the page to render (e.g. 1).
+      dpi: Rasterization resolution in dots per inch (default 150, recommended 150-300).
+
+    Returns:
+      JSON string containing the rendered image path and verification status.
+    """
     return hpe_render_clean_verify(pdf_path=pdf_path, page_number=page_number, dpi=dpi)
+
 
 
 def main():
