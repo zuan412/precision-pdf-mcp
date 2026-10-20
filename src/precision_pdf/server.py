@@ -42,7 +42,9 @@ def hpe_inspect_virtual_grid(pdf_path: str, page_number: int, dpi: int = 150) ->
                 "baseline_y": round(s.get("baseline_y", 0), 1),
                 "width": round(s.get("width", 0), 1),
                 "height": round(s.get("height", 0), 1),
-                "multiline_next": s.get("multiline_next", False)
+                "multiline_next": s.get("multiline_next", False),
+                "context": s.get("context", ""),
+                "question_hint": s.get("question_hint")
             }
 
         return json.dumps({
@@ -65,18 +67,21 @@ def hpe_fill_slots(
     output_path: Optional[str] = None
 ) -> str:
     """
-    Inject answers into the PDF using Slot IDs (e.g. {"S01": "answer", "S02": "B"}).
+    Inject answers into the PDF using Slot IDs (e.g. {"S01": "answer", "S02": "B"}) or graphical operations.
     Guarantees:
       - 100% baseline snap on printed lines (zero floating text).
       - 100% center alignment in boxes (zero off-center boxes).
       - Automatic multi-line wrapping across consecutive lines for long answers.
       - Automatic font scaling to avoid text collision or overflow.
+      - Full Unicode / Vietnamese character set support.
+      - Graphical operations: cross marks ("cross_..."), connector lines ("connector_..."),
+        word circling with question grounding ("circle_word" with "question_hint").
       - 100% CLEAN OUTPUT: Final PDF contains ONLY answers (zero grid lines, zero badges).
     Args:
       pdf_path: Path to target PDF.
       page_number: 1-based page number.
-      slot_answers_json: JSON string mapping slot tags to answers:
-                         e.g. '{"S01": "went", "S02": ["line 1 text", "line 2 text"], "circle_option": "A"}'
+      slot_answers_json: JSON string mapping slot tags or graphical operation keys to answers:
+                         e.g. '{"S01": "went", "circle_word_1": {"word": "A", "question_hint": "1"}, "cross_1": {"cx": 100, "cy": 120}, "connector_1": {"x0": 50, "y0": 60, "x1": 150, "y1": 60}}'
       output_path: Optional output path. If omitted, overwrites safely via atomic replace.
     Returns status JSON with saved path.
     """
@@ -161,14 +166,20 @@ def hpe_snap_fill(
             return hpe_fill_slots(pdf_path, page_number, operations_json, output_path)
         elif isinstance(data, list):
             answers = {}
-            for op in data:
+            for i, op in enumerate(data):
                 op_type = op.get("type", "")
                 if op_type == "text_on_line":
-                    answers[f"op_line_{op.get('y', 0)}"] = op.get("text", "")
-                elif op_type == "circle_word":
-                    answers["circle_option"] = op.get("word", "")
-                elif op_type == "underline_word":
-                    answers["underline_option"] = op.get("word", "")
+                    answers[f"op_line_{op.get('y', 0)}_{i}"] = op
+                elif op_type in ["circle_word", "circle_option"]:
+                    answers[f"circle_word_{i}"] = op
+                elif op_type in ["underline_word", "underline_option"]:
+                    answers[f"underline_word_{i}"] = op
+                elif op_type in ["cross", "cross_word"]:
+                    answers[f"cross_{i}"] = op
+                elif op_type in ["connector", "connector_line", "line"]:
+                    answers[f"connector_{i}"] = op
+                else:
+                    answers[f"op_{i}"] = op
             return hpe_fill_slots(pdf_path, page_number, json.dumps(answers), output_path)
         return json.dumps({"error": "Invalid operations_json format"}, ensure_ascii=False)
     except Exception as e:

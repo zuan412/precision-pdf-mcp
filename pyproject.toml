@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "precision-pdf-mcp"
-version = "0.1.0"
-description = "Pixel-perfect PDF form and worksheet filling for AI agents using Virtual Excel Matrix & Set-of-Marks baseline snapping."
+version = "0.2.0"
+description = "🐍 🎯 Pixel-perfect PDF form and worksheet filling for AI agents using Virtual Excel Matrix & Set-of-Marks baseline snapping."
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.10"

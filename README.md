@@ -148,28 +148,35 @@ In your `mcp_config.json`:
 ## 🧰 Available MCP Tools
 
 ### `hpe_inspect_virtual_grid`
-Generates a temporary Virtual Excel Matrix inspector image with Set-of-Marks badges (`[S01]`, `[S02]`...) and returns a JSON catalog of detected slots.
+Generates a temporary Virtual Excel Matrix inspector image with Set-of-Marks badges (`[S01]`, `[S02]`...) and returns a JSON catalog of detected slots enriched with **Semantic Context Grounding**.
 * **Arguments:**
   - `pdf_path` (string, required): Absolute path to the PDF.
   - `page_number` (int, required): 1-based page number.
   - `dpi` (int, optional, default: 150): Image resolution.
 * **Returns:**
   - `inspector_image_path`: Path to the image for agent visual inspection.
-  - `slots`: Dictionary of slots containing grid address (e.g. `Col D, Row 14`), type, baseline, and width.
+  - `slots`: Dictionary of slots containing:
+    - `grid_address`: Virtual Excel coordinate (e.g. `Col D, Row 14`).
+    - `context`: Preceding prompt text extracted from the page (e.g. `"1. Jenny decided to ________"`).
+    - `question_hint`: Question number or letter (e.g. `"1"`).
+    - `type`, `baseline_y`, `width`, `height`.
 
 ### `hpe_fill_slots`
-Injects answers directly into the target PDF using Slot IDs.
+Injects answers directly into the target PDF using Slot IDs or explicit primitives with **100% Unicode & Diacritics support**.
 * **Arguments:**
   - `pdf_path` (string, required): Absolute path to the PDF.
   - `page_number` (int, required): 1-based page number.
   - `slot_answers_json` (string, required): JSON string of answers.
-    - Slot map: `{"S01": "must have left", "S02": "could do"}`
+    - Slot map: `{"S01": "must have left", "S02": "tiếng Việt có dấu"}`
     - Multi-line wrap: `{"S03": ["first line text", "second line text"]}`
-    - Option circle: `{"circle_option": "A"}`
+    - Option circle (scoped): `{"circle_option": {"word": "B", "question_hint": "3"}}`
+    - Cross mark: `{"cross_01": {"cx": 120.0, "cy": 350.0}}`
+    - Connector line: `{"connector_01": {"from": [100, 200], "to": [300, 250]}}`
     - Option underline: `{"underline_option": "Shall"}`
   - `output_path` (string, optional): Output PDF path. If omitted, safely updates in-place.
 * **Guarantees:**
   - **100% baseline snap** (rests naturally on the printed line).
+  - **Full Unicode Vietnamese support** (auto-embeds TTF with proper diacritics).
   - **Zero grid pollution** (no rulers or badges in final output).
 
 ### `hpe_render_clean_verify`

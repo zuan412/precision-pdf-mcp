@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image, ImageDraw
 from typing import Dict, List, Any, Optional, Tuple, Union
 
-from .utils import resolve_system_font, logger
+from .utils import resolve_system_font, resolve_unicode_font, get_default_temp_dir, logger
 
 
 class HPEEngine:
@@ -24,18 +24,9 @@ class HPEEngine:
         if not os.path.exists(pdf_path):
             raise FileNotFoundError(f"PDF not found: {pdf_path}")
         self.pdf_path = os.path.abspath(pdf_path)
-        if temp_dir:
-            self.temp_dir = temp_dir
-        elif os.environ.get("PRECISION_PDF_TEMP_DIR"):
-            self.temp_dir = os.environ.get("PRECISION_PDF_TEMP_DIR")
-        else:
-            pdf_drive = os.path.splitdrive(self.pdf_path)[0]
-            agent_temp = os.path.join(pdf_drive if pdf_drive else "D:", ".agent_temp", "scratch")
-            if os.path.exists(agent_temp):
-                self.temp_dir = agent_temp
-            else:
-                self.temp_dir = os.path.dirname(self.pdf_path)
+        self.temp_dir = get_default_temp_dir(self.pdf_path, temp_dir)
         os.makedirs(self.temp_dir, exist_ok=True)
+
 
     # -------------------------------------------------------------------------
     # 1. Multi-Layer Slot Detection Pipeline
@@ -60,7 +51,27 @@ class HPEEngine:
 
         raw_slots = []
 
-        # Layer 1: Vector geometry via pdfplumber
+        # Layer 1: Vector geometry via PyMuPDF get_drawings & pdfplumber
+        try:
+            for d in page.get_drawings():
+                for it in d.get("items", []):
+                    if it[0] == "re":
+                        r = it[1]
+                        w = abs(r.width)
+                        h = abs(r.height)
+                        if 8.0 <= w <= 500.0 and 8.0 <= h <= 100.0 and r.y0 >= 55.0:
+                            raw_slots.append({
+                                "type": "box",
+                                "source": "vector",
+                                "bbox": (float(r.x0), float(r.y0), float(r.x1), float(r.y1)),
+                                "cx": float((r.x0 + r.x1) / 2.0),
+                                "cy": float((r.y0 + r.y1) / 2.0),
+                                "width": float(w),
+                                "height": float(h)
+                            })
+        except Exception as e:
+            logger.debug(f"PyMuPDF vector rect extraction skipped: {e}")
+
         try:
             with pdfplumber.open(self.pdf_path) as plum:
                 p_plum = plum.pages[page_idx]
@@ -70,12 +81,13 @@ class HPEEngine:
                     x0, y0, x1, y1 = line["x0"], line["top"], line["x1"], line["bottom"]
                     w = abs(x1 - x0)
                     h = abs(y1 - y0)
-                    if h <= 2.5 and w >= 20.0:
+                    baseline_y = float((y0 + y1) / 2.0)
+                    if h <= 2.5 and w >= 20.0 and baseline_y >= 55.0:
                         raw_slots.append({
                             "type": "underline",
                             "source": "vector",
                             "bbox": (min(x0, x1), y0 - 10.0, max(x0, x1), y1 + 3.0),
-                            "baseline_y": float((y0 + y1) / 2.0),
+                            "baseline_y": baseline_y,
                             "x0": float(min(x0, x1)),
                             "x1": float(max(x0, x1)),
                             "width": float(w),
@@ -87,7 +99,7 @@ class HPEEngine:
                     x0, top, x1, bottom = rect["x0"], rect["top"], rect["x1"], rect["bottom"]
                     w = abs(x1 - x0)
                     h = abs(bottom - top)
-                    if 8.0 <= w <= 260.0 and 8.0 <= h <= 100.0 and top > 80.0:
+                    if 8.0 <= w <= 500.0 and 8.0 <= h <= 100.0 and top >= 55.0:
                         raw_slots.append({
                             "type": "box",
                             "source": "vector",
@@ -103,16 +115,17 @@ class HPEEngine:
         # Layer 2: In-Memory Morphological Raster Line Scanning (NumPy)
         raster_lines = self._scan_raster_lines(page, dpi=dpi, min_width_pt=35.0)
         for rl in raster_lines:
-            raw_slots.append({
-                "type": "underline",
-                "source": "raster",
-                "bbox": (rl["x0"], rl["y"] - 12.0, rl["x1"], rl["y"] + 2.0),
-                "baseline_y": float(rl["y"]),
-                "x0": float(rl["x0"]),
-                "x1": float(rl["x1"]),
-                "width": float(rl["width"]),
-                "height": 14.0
-            })
+            if rl["y"] >= 55.0:
+                raw_slots.append({
+                    "type": "underline",
+                    "source": "raster",
+                    "bbox": (rl["x0"], rl["y"] - 12.0, rl["x1"], rl["y"] + 2.0),
+                    "baseline_y": float(rl["y"]),
+                    "x0": float(rl["x0"]),
+                    "x1": float(rl["x1"]),
+                    "width": float(rl["width"]),
+                    "height": 14.0
+                })
 
         # Layer 3: Text-based underscores & gap markers via PyMuPDF
         words = page.get_text("words")
@@ -126,40 +139,55 @@ class HPEEngine:
                 prefix_len = len(text.rstrip("_"))
                 total_len = len(text)
                 x_start = w[0] + (w[2] - w[0]) * (prefix_len / total_len) if total_len > 0 else w[0]
-                raw_slots.append({
-                    "type": "underline",
-                    "source": "text_underscore",
-                    "bbox": (float(x_start), float(w[1]), float(w[2]), float(w[3])),
-                    "baseline_y": float(w[3] - 1.5),
-                    "x0": float(x_start),
-                    "x1": float(w[2]),
-                    "width": float(w[2] - x_start),
-                    "height": float(w[3] - w[1])
-                })
+                baseline_y = float(w[3] - 1.5)
+                if baseline_y >= 55.0:
+                    raw_slots.append({
+                        "type": "underline",
+                        "source": "text_underscore",
+                        "bbox": (float(x_start), float(w[1]), float(w[2]), float(w[3])),
+                        "baseline_y": baseline_y,
+                        "x0": float(x_start),
+                        "x1": float(w[2]),
+                        "width": float(w[2] - x_start),
+                        "height": float(w[3] - w[1])
+                    })
 
             # 3B. Numbered gap markers: '1)', '2)', '(1)', '(2)', '1.'
             m_gap = re.match(r"^(\(?\d{1,2}\.?\)?)$", text)
             if m_gap and ("_" not in text):
-                marker = m_gap.group(1)
-                gap_x0 = float(w[2] + 4.0)
-                gap_x1 = float(w[2] + 55.0)
-                raw_slots.append({
-                    "type": "gap",
-                    "source": "gap_marker",
-                    "bbox": (gap_x0, float(w[1]), gap_x1, float(w[3])),
-                    "baseline_y": float(w[3] - 1.5),
-                    "x0": gap_x0,
-                    "x1": gap_x1,
-                    "width": float(gap_x1 - gap_x0),
-                    "height": float(w[3] - w[1]),
-                    "marker": marker
-                })
+                # Ensure there isn't an immediate word right after (e.g. '1. What' is a question heading, not a gap)
+                has_immediate_next_word = any(
+                    other[0] > w[2] and other[0] < (w[2] + 25.0) and abs(other[3] - w[3]) < 6.0
+                    for other in words if other != w
+                )
+                if not has_immediate_next_word:
+                    marker = m_gap.group(1)
+                    gap_x0 = float(w[2] + 4.0)
+                    gap_x1 = float(w[2] + 55.0)
+                    baseline_y = float(w[3] - 1.5)
+                    if baseline_y >= 55.0:
+                        raw_slots.append({
+                            "type": "gap",
+                            "source": "gap_marker",
+                            "bbox": (gap_x0, float(w[1]), gap_x1, float(w[3])),
+                            "baseline_y": baseline_y,
+                            "x0": gap_x0,
+                            "x1": gap_x1,
+                            "width": float(gap_x1 - gap_x0),
+                            "height": float(w[3] - w[1]),
+                            "marker": marker
+                        })
 
         doc.close()
 
-        # Deduplicate, apply padding guard, and identify multi-line groups
+        # Deduplicate, apply dynamic margin guard, padding guard, semantic context, and multi-line grouping
         filtered_slots = self._deduplicate_slots(raw_slots)
+        filtered_slots = [
+            s for s in filtered_slots
+            if s.get("baseline_y", s["bbox"][1]) >= 55.0
+        ]
         self._apply_padding_guard(filtered_slots, sorted_words)
+        self._extract_semantic_context(filtered_slots, words)
         self._identify_multiline_groups(filtered_slots)
 
         return filtered_slots
@@ -221,7 +249,7 @@ class HPEEngine:
     def _deduplicate_slots(self, raw_slots: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """Deduplicates slots where vector, raster, and text overlaps refer to the same blank."""
         unique = []
-        priority = {"raster": 3, "vector": 2, "text_underscore": 1, "gap_marker": 2}
+        priority = {"vector": 3, "raster": 2, "gap_marker": 2, "text_underscore": 1}
         raw_slots.sort(key=lambda s: (-priority.get(s.get("source", ""), 0), s["bbox"][1], s["bbox"][0]))
 
         for s in raw_slots:
@@ -229,7 +257,13 @@ class HPEEngine:
             is_dup = False
             for u in unique:
                 ux0, uy0, ux1, uy1 = u["bbox"]
-                if abs(by0 - uy0) < 6.0:
+                if u["type"] == "box":
+                    sy = s.get("baseline_y", (by0 + by1) / 2.0)
+                    if (uy0 - 4.0) <= sy <= (uy1 + 4.0):
+                        if min(bx1, ux1) > max(bx0, ux0):
+                            is_dup = True
+                            break
+                elif abs(by0 - uy0) < 6.0:
                     overlap_x0 = max(bx0, ux0)
                     overlap_x1 = min(bx1, ux1)
                     if overlap_x1 > overlap_x0:
@@ -260,22 +294,86 @@ class HPEEngine:
                 last_w = max(preceding_words, key=lambda w: w[2])
                 min_safe_x = last_w[2] + 6.0
                 if s["x0"] < min_safe_x:
-                    delta = min_safe_x - s["x0"]
                     s["x0"] = min_safe_x
-                    s["width"] = max(10.0, s["width"] - delta)
-                    s["bbox"] = (s["x0"], s["bbox"][1], s["bbox"][2], s["bbox"][3])
+                    new_x1 = max(s["bbox"][2], s["x0"] + 10.0)
+                    s["width"] = new_x1 - s["x0"]
+                    s["bbox"] = (s["x0"], s["bbox"][1], new_x1, s["bbox"][3])
+
+    def _extract_semantic_context(self, slots: List[Dict[str, Any]], words: List[Tuple]):
+        """
+        Extracts preceding text context (up to 80 chars) and question hint
+        (e.g. '1', '2', 'A', 'B') for each detected slot within [x0 - 250pt, x0].
+        """
+        for s in slots:
+            slot_x0 = s["x0"] if s["type"] in ["underline", "gap"] else s["bbox"][0]
+            slot_y = s.get("baseline_y") if s["type"] in ["underline", "gap"] else s.get("cy", (s["bbox"][1] + s["bbox"][3]) / 2.0)
+
+            # Match words on the same line preceding the slot
+            cand_words = [
+                w for w in words
+                if abs(w[3] - slot_y) <= 9.0 and (slot_x0 - 250.0) <= w[0] < slot_x0 and w[2] <= (slot_x0 + 4.0)
+            ]
+            if not cand_words:
+                # Fallback: check prompt text just above slot
+                cand_words = [
+                    w for w in words
+                    if (slot_y - 45.0) <= w[3] < (slot_y - 2.0) and (slot_x0 - 250.0) <= w[0] <= (slot_x0 + 250.0)
+                ]
+                cand_words.sort(key=lambda w: (round(w[1] / 6.0), w[0]))
+            else:
+                cand_words.sort(key=lambda w: w[0])
+
+            full_context = " ".join(w[4] for w in cand_words).strip()
+
+            question_hint = None
+            if full_context:
+                m_num = re.search(r'\b(?:(?:Question|Câu|Bài|Part|Ex|Exercise)\s*)?\(?([0-9]{1,3})\)?(?:\.|\)|\:|\-|\s|$)', full_context, re.IGNORECASE)
+                if m_num:
+                    question_hint = m_num.group(1)
+                else:
+                    m_letter = re.search(r'\b([A-H])(?:\.|\)|\:|\-|\s|$)', full_context)
+                    if m_letter:
+                        question_hint = m_letter.group(1)
+
+            if not question_hint and s.get("marker"):
+                m_marker = re.search(r'([0-9]{1,3}|[A-H])', s["marker"])
+                if m_marker:
+                    question_hint = m_marker.group(1)
+
+            context = full_context[-80:].strip() if len(full_context) > 80 else full_context
+            s["context"] = context
+            s["question_hint"] = question_hint
 
     def _identify_multiline_groups(self, slots: List[Dict[str, Any]]):
-        """Identifies vertically stacked lines for the same question."""
-        for i in range(len(slots) - 1):
-            curr = slots[i]
-            nxt = slots[i + 1]
-            if curr["type"] == "underline" and nxt["type"] == "underline":
+        """Identifies vertically stacked lines for the same question, clustered by column x."""
+        underline_slots = [s for s in slots if s.get("type") == "underline"]
+        if not underline_slots:
+            return
+
+        # Cluster by horizontal column alignment (x0 within 20pt)
+        columns: List[List[Dict[str, Any]]] = []
+        for s in sorted(underline_slots, key=lambda item: item["x0"]):
+            placed = False
+            for col in columns:
+                col_x0 = sum(item["x0"] for item in col) / len(col)
+                if abs(s["x0"] - col_x0) < 20.0:
+                    col.append(s)
+                    placed = True
+                    break
+            if not placed:
+                columns.append([s])
+
+        for col in columns:
+            col.sort(key=lambda item: item["baseline_y"])
+            for i in range(len(col) - 1):
+                curr = col[i]
+                nxt = col[i + 1]
                 dy = nxt["baseline_y"] - curr["baseline_y"]
                 dx = abs(nxt["x0"] - curr["x0"])
-                if 10.0 <= dy <= 20.0 and dx < 15.0:
+                if 10.0 <= dy <= 25.0 and dx < 15.0:
                     curr["multiline_next"] = True
                     nxt["multiline_prev"] = True
+                    curr["_next_slot_ref"] = nxt
 
     # -------------------------------------------------------------------------
     # 2. Virtual Excel Matrix & Set-of-Marks Inspector
@@ -313,6 +411,10 @@ class HPEEngine:
             s["tag"] = tag
             s["grid_address"] = f"Col {col_letter}, Row {row_idx}"
             slot_catalog[tag] = s
+
+        for s in slots:
+            if s.get("_next_slot_ref"):
+                s["multiline_next_tag"] = s["_next_slot_ref"].get("tag")
 
         doc = fitz.open(self.pdf_path)
         page = doc[page_idx]
@@ -382,12 +484,14 @@ class HPEEngine:
                 fill_col = (204, 251, 241, 75)
                 badge_bg = (13, 148, 136)
 
-            draw.rectangle([px0, py0, px1, py1], outline=border_col, fill=fill_col, width=2)
+            rx0, ry0 = min(px0, px1), min(py0, py1)
+            rx1, ry1 = max(px0, px1), max(py0, py1)
+            draw.rectangle([rx0, ry0, rx1, ry1], outline=border_col, fill=fill_col, width=2)
 
             badge_w = 34
             badge_h = 16
-            b_x = max(RULER_W, px0 - 2)
-            b_y = max(RULER_H, py0 - badge_h + 1)
+            b_x = max(RULER_W, rx0 - 2)
+            b_y = max(RULER_H, ry0 - badge_h + 1)
             draw.rectangle([b_x, b_y, b_x + badge_w, b_y + badge_h], fill=badge_bg)
             draw.text((b_x + 4, b_y + 2), tag, fill=(255, 255, 255), font=font_badge)
 
@@ -424,6 +528,9 @@ class HPEEngine:
                 tag = f"S{i+1:02d}"
                 s["tag"] = tag
                 slot_catalog[tag] = s
+            for s in slots:
+                if s.get("_next_slot_ref"):
+                    s["multiline_next_tag"] = s["_next_slot_ref"].get("tag")
 
         doc = fitz.open(self.pdf_path)
         if page_idx < 0 or page_idx >= len(doc):
@@ -441,13 +548,30 @@ class HPEEngine:
             elif slot_key.startswith("tick_") or slot_key.startswith("check_"):
                 self._handle_tick_operation(page, answer_val)
                 continue
+            elif slot_key.startswith("cross_"):
+                self._handle_cross_operation(page, answer_val)
+                continue
+            elif slot_key.startswith("connector_") or slot_key.startswith("line_"):
+                self._handle_connector_line(page, answer_val)
+                continue
             elif slot_key.startswith("custom_text"):
                 self._handle_custom_text(page, answer_val)
                 continue
 
-            if isinstance(answer_val, dict) and ("y" in answer_val or "baseline_y" in answer_val) and "text" in answer_val:
-                self._handle_custom_text(page, answer_val)
-                continue
+            if isinstance(answer_val, dict):
+                op_type = answer_val.get("type", "")
+                if op_type in ["cross", "cross_word"]:
+                    self._handle_cross_operation(page, answer_val)
+                    continue
+                elif op_type in ["connector", "connector_line"]:
+                    self._handle_connector_line(page, answer_val)
+                    continue
+                elif op_type in ["circle_word", "circle_option"]:
+                    self._handle_circle_operation(page, answer_val)
+                    continue
+                elif ("y" in answer_val or "baseline_y" in answer_val) and "text" in answer_val:
+                    self._handle_custom_text(page, answer_val)
+                    continue
 
             if slot_key not in slot_catalog:
                 continue
@@ -473,10 +597,9 @@ class HPEEngine:
 
             # Smart Multi-Line Distribution
             if slot.get("multiline_next") and not isinstance(text, list):
-                calc_len = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+                calc_len = self._calc_text_len(text, fontname=fontname, fontsize=fontsize)
                 if calc_len > (slot["width"] - 8.0):
-                    next_idx = int(slot_key[1:]) + 1
-                    next_tag = f"S{next_idx:02d}"
+                    next_tag = slot.get("multiline_next_tag") or f"S{int(slot_key[1:]) + 1:02d}"
                     if next_tag in slot_catalog:
                         words_list = text.split()
                         mid = len(words_list) // 2
@@ -490,8 +613,7 @@ class HPEEngine:
                 if len(text) > 0:
                     self._inject_single_slot(page, slot, text[0], fontname, fontsize, color)
                 if len(text) > 1:
-                    next_idx = int(slot_key[1:]) + 1
-                    next_tag = f"S{next_idx:02d}"
+                    next_tag = slot.get("multiline_next_tag") or f"S{int(slot_key[1:]) + 1:02d}"
                     if next_tag in slot_catalog:
                         self._inject_single_slot(page, slot_catalog[next_tag], text[1], fontname, fontsize, color)
                 continue
@@ -510,17 +632,43 @@ class HPEEngine:
         os.replace(temp_file, target_out)
         return target_out
 
+    @staticmethod
+    def _calc_text_len(text: str, fontname: str = "helv", fontsize: float = 9.5) -> float:
+        """Safely calculates rendered text length with TrueType font fallback for non-ASCII."""
+        if any(ord(c) > 127 for c in text):
+            fpath = resolve_unicode_font(bold=("bold" in fontname.lower() or fontname == "hebo"))
+            if fpath:
+                try:
+                    return fitz.Font(fontfile=fpath).text_length(text, fontsize=fontsize)
+                except Exception:
+                    pass
+        try:
+            return fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+        except Exception:
+            try:
+                return fitz.get_text_length(text, fontname="helv", fontsize=fontsize)
+            except Exception:
+                return len(text) * fontsize * 0.55
+
     def _inject_single_slot(self, page, slot, text: str, fontname: str, fontsize: float, color: tuple):
-        """Injects text into a single slot with baseline snapping and auto-scaling."""
+        """Injects text into a single slot with baseline snapping, auto-scaling, and Unicode Vietnamese support."""
         text = str(text).replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"').strip()
         slot_type = slot["type"]
+
+        if any(ord(c) > 127 for c in text):
+            is_bold = "bold" in fontname.lower() or fontname == "hebo" or (slot_type == "box" and len(text) <= 2)
+            unicode_font_path = resolve_unicode_font(bold=is_bold)
+            if unicode_font_path:
+                font_tag = "vn_font_bold" if is_bold else "vn_font"
+                page.insert_font(fontname=font_tag, fontfile=unicode_font_path)
+                fontname = font_tag
 
         if slot_type in ["underline", "gap"]:
             line_y = slot.get("baseline_y", slot["bbox"][3])
             x0 = slot["x0"]
             max_w = slot["width"]
 
-            calc_len = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+            calc_len = self._calc_text_len(text, fontname=fontname, fontsize=fontsize)
             if calc_len > (max_w - 4.0) and max_w > 20.0:
                 fontsize = max(6.5, fontsize * ((max_w - 4.0) / calc_len))
 
@@ -533,10 +681,10 @@ class HPEEngine:
             cy = slot.get("cy", (slot["bbox"][1] + slot["bbox"][3]) / 2.0)
             box_w = slot["width"]
 
-            calc_len = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+            calc_len = self._calc_text_len(text, fontname=fontname, fontsize=fontsize)
             if calc_len > (box_w - 3.0):
                 fontsize = max(6.5, fontsize * ((box_w - 3.0) / calc_len))
-                calc_len = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+                calc_len = self._calc_text_len(text, fontname=fontname, fontsize=fontsize)
 
             x_pos = cx - (calc_len / 2.0)
             y_pos = cy + (fontsize * 0.35)
@@ -557,15 +705,15 @@ class HPEEngine:
                 page.draw_line(fitz.Point(b[0], b[3] + 1.2), fitz.Point(b[2], b[3] + 1.2), color=color, width=width)
             else:
                 word = target_info.get("word")
-                hint_y = target_info.get("hint_y")
+                hint_y = target_info.get("hint_y", target_info.get("y_hint"))
                 clip = fitz.Rect(target_info["clip"]) if "clip" in target_info else None
                 matches = page.search_for(word.strip(), clip=clip)
                 if matches:
-                    rect = matches[0] if hint_y is None else min(matches, key=lambda r: abs(r.y0 - hint_y))
+                    rect = matches[0] if hint_y is None else min(matches, key=lambda r: abs(r.y0 - float(hint_y)))
                     page.draw_line(fitz.Point(rect.x0, rect.y1 + 1.2), fitz.Point(rect.x1, rect.y1 + 1.2), color=color, width=width)
 
     def _handle_circle_operation(self, page, target_info: Any):
-        """Draws a smooth vector ellipse around target word or option letter."""
+        """Draws a smooth vector ellipse around target word or option letter with question grounding."""
         color = (0.0, 0.2, 0.6)
         width = 1.3
         if isinstance(target_info, str):
@@ -579,8 +727,10 @@ class HPEEngine:
                 ry = (rect.height / 2.0) + 3.0
                 page.draw_oval(fitz.Rect(cx - rx, cy - ry, cx + rx, cy + ry), color=color, width=width)
         elif isinstance(target_info, dict):
+            color = tuple(target_info.get("color", color))
+            width = float(target_info.get("width", width))
             if "cx" in target_info and "cy" in target_info:
-                cx, cy = target_info["cx"], target_info["cy"]
+                cx, cy = float(target_info["cx"]), float(target_info["cy"])
                 rx = float(target_info.get("rx", 7.0))
                 ry = float(target_info.get("ry", 6.0))
                 page.draw_oval(fitz.Rect(cx - rx, cy - ry, cx + rx, cy + ry), color=color, width=width)
@@ -595,13 +745,102 @@ class HPEEngine:
                 word = target_info.get("word", "")
                 clip = fitz.Rect(target_info["clip"]) if "clip" in target_info else None
                 matches = page.search_for(word.strip(), clip=clip)
+                if not matches:
+                    return
+
+                target_y = None
+                if "y_hint" in target_info or "hint_y" in target_info:
+                    target_y = float(target_info.get("y_hint", target_info.get("hint_y")))
+                elif "question_hint" in target_info and target_info["question_hint"]:
+                    q_hint = str(target_info["question_hint"]).strip()
+                    for pat in [f"{q_hint}.", f"{q_hint})", f"({q_hint})", f"{q_hint}:", f"Question {q_hint}", f"Câu {q_hint}"]:
+                        q_hits = page.search_for(pat)
+                        if q_hits:
+                            target_y = q_hits[0].y0
+                            break
+
+                if target_y is not None:
+                    candidates = [r for r in matches if r.y0 >= (target_y - 10.0) and r.y0 <= (target_y + 120.0)]
+                    rect = min(candidates, key=lambda r: abs(r.y0 - target_y)) if candidates else min(matches, key=lambda r: abs(r.y0 - target_y))
+                else:
+                    rect = matches[0]
+
+                cx = (rect.x0 + rect.x1) / 2.0
+                cy = (rect.y0 + rect.y1) / 2.0
+                rx = (rect.width / 2.0) + float(target_info.get("pad_x", 4.0))
+                ry = (rect.height / 2.0) + float(target_info.get("pad_y", 3.0))
+                page.draw_oval(fitz.Rect(cx - rx, cy - ry, cx + rx, cy + ry), color=color, width=width)
+
+    def _handle_cross_operation(self, page, cross_info: Any):
+        """Draws a crisp vector cross (X) at (cx, cy) or within a bbox."""
+        color = (0.0, 0.2, 0.6)
+        width = 1.5
+        size = 4.5
+        cx, cy = None, None
+
+        if isinstance(cross_info, dict):
+            color = tuple(cross_info.get("color", color))
+            width = float(cross_info.get("width", width))
+            size = float(cross_info.get("size", size))
+            if "cx" in cross_info and "cy" in cross_info:
+                cx, cy = float(cross_info["cx"]), float(cross_info["cy"])
+            elif "bbox" in cross_info:
+                b = cross_info["bbox"]
+                cx = (b[0] + b[2]) / 2.0
+                cy = (b[1] + b[3]) / 2.0
+                if "size" not in cross_info:
+                    size = max(3.5, min(b[2] - b[0], b[3] - b[1]) * 0.35)
+            elif "word" in cross_info:
+                word = cross_info.get("word", "")
+                clip = fitz.Rect(cross_info["clip"]) if "clip" in cross_info else None
+                matches = page.search_for(word.strip(), clip=clip)
                 if matches:
                     rect = matches[0]
                     cx = (rect.x0 + rect.x1) / 2.0
                     cy = (rect.y0 + rect.y1) / 2.0
-                    rx = (rect.width / 2.0) + float(target_info.get("pad_x", 4.0))
-                    ry = (rect.height / 2.0) + float(target_info.get("pad_y", 3.0))
-                    page.draw_oval(fitz.Rect(cx - rx, cy - ry, cx + rx, cy + ry), color=color, width=width)
+                    if "size" not in cross_info:
+                        size = max(3.5, min(rect.width, rect.height) * 0.35)
+        elif isinstance(cross_info, (list, tuple)) and len(cross_info) >= 2:
+            cx, cy = float(cross_info[0]), float(cross_info[1])
+
+        if cx is not None and cy is not None:
+            p1 = fitz.Point(cx - size, cy - size)
+            p2 = fitz.Point(cx + size, cy + size)
+            p3 = fitz.Point(cx - size, cy + size)
+            p4 = fitz.Point(cx + size, cy - size)
+            page.draw_line(p1, p2, color=color, width=width)
+            page.draw_line(p3, p4, color=color, width=width)
+
+    def _handle_connector_line(self, page, conn_info: Any):
+        """Draws a vector connector line between two points (x0, y0) and (x1, y1)."""
+        color = (0.0, 0.2, 0.6)
+        width = 1.3
+        x0 = y0 = x1 = y1 = None
+
+        if isinstance(conn_info, dict):
+            color = tuple(conn_info.get("color", color))
+            width = float(conn_info.get("width", width))
+            if "x0" in conn_info and "y0" in conn_info and "x1" in conn_info and "y1" in conn_info:
+                x0, y0 = float(conn_info["x0"]), float(conn_info["y0"])
+                x1, y1 = float(conn_info["x1"]), float(conn_info["y1"])
+            elif "start" in conn_info and "end" in conn_info:
+                x0, y0 = float(conn_info["start"][0]), float(conn_info["start"][1])
+                x1, y1 = float(conn_info["end"][0]), float(conn_info["end"][1])
+            elif "from" in conn_info and "to" in conn_info:
+                x0, y0 = float(conn_info["from"][0]), float(conn_info["from"][1])
+                x1, y1 = float(conn_info["to"][0]), float(conn_info["to"][1])
+            elif "points" in conn_info and len(conn_info["points"]) >= 2:
+                x0, y0 = float(conn_info["points"][0][0]), float(conn_info["points"][0][1])
+                x1, y1 = float(conn_info["points"][1][0]), float(conn_info["points"][1][1])
+        elif isinstance(conn_info, (list, tuple)):
+            if len(conn_info) == 4 and all(isinstance(v, (int, float)) for v in conn_info):
+                x0, y0, x1, y1 = [float(v) for v in conn_info]
+            elif len(conn_info) >= 2 and isinstance(conn_info[0], (list, tuple)) and isinstance(conn_info[1], (list, tuple)):
+                x0, y0 = float(conn_info[0][0]), float(conn_info[0][1])
+                x1, y1 = float(conn_info[1][0]), float(conn_info[1][1])
+
+        if x0 is not None and y0 is not None and x1 is not None and y1 is not None:
+            page.draw_line(fitz.Point(x0, y0), fitz.Point(x1, y1), color=color, width=width)
 
     def _handle_tick_operation(self, page, tick_info: Any):
         """Draws a crisp vector checkmark at (cx, cy)."""
@@ -617,7 +856,7 @@ class HPEEngine:
             page.draw_line(p2, p3, color=color, width=width)
 
     def _handle_custom_text(self, page, text_info: Any):
-        """Places text at an exact custom position with baseline snap."""
+        """Places text at an exact custom position with baseline snap and Unicode Vietnamese support."""
         if isinstance(text_info, dict):
             text = str(text_info.get("text", "")).strip()
             x = float(text_info.get("x", text_info.get("x0", 0)))
@@ -626,8 +865,17 @@ class HPEEngine:
             fontname = str(text_info.get("fontname", "helv"))
             color = tuple(text_info.get("color", (0.0, 0.2, 0.6)))
             align = text_info.get("align", "left")
+
+            if any(ord(c) > 127 for c in text):
+                is_bold = "bold" in fontname.lower() or fontname == "hebo"
+                unicode_font_path = resolve_unicode_font(bold=is_bold)
+                if unicode_font_path:
+                    font_tag = "vn_font_bold" if is_bold else "vn_font"
+                    page.insert_font(fontname=font_tag, fontfile=unicode_font_path)
+                    fontname = font_tag
+
             if align == "center":
-                calc_len = fitz.get_text_length(text, fontname=fontname, fontsize=fontsize)
+                calc_len = self._calc_text_len(text, fontname=fontname, fontsize=fontsize)
                 x = x - (calc_len / 2.0)
             elif align == "line":
                 y = y - 1.2
