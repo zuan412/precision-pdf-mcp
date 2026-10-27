@@ -267,6 +267,110 @@ class TestPrecisionPDF(unittest.TestCase):
         self.assertIn("Trần Thị Mai", doc_out[0].get_text())
         doc_out.close()
 
+    def test_column_aware_reading_order(self):
+        """Verifies multi-column layout detection and Left->Right column reading order."""
+        col_pdf = os.path.join(self.temp_dir, "two_column_test.pdf")
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+
+        # Left column (x=50..250): Ex 1 (y=120) and Ex 2 (y=300)
+        page.insert_text(fitz.Point(50, 100), "Exercise 1: Vocabulary", fontsize=11)
+        page.insert_text(fitz.Point(50, 120), "1. First left item:", fontsize=10)
+        page.draw_line(fitz.Point(150, 122), fitz.Point(240, 122), color=(0, 0, 0), width=1.0)
+
+        page.insert_text(fitz.Point(50, 280), "Exercise 2: Grammar", fontsize=11)
+        page.insert_text(fitz.Point(50, 300), "2. Second left item:", fontsize=10)
+        page.draw_line(fitz.Point(150, 302), fitz.Point(240, 302), color=(0, 0, 0), width=1.0)
+
+        # Right column (x=330..530): Ex 3 (y=120) and Ex 4 (y=300)
+        page.insert_text(fitz.Point(330, 100), "Exercise 3: Reading", fontsize=11)
+        page.insert_text(fitz.Point(330, 120), "1. First right item:", fontsize=10)
+        page.draw_line(fitz.Point(430, 122), fitz.Point(520, 122), color=(0, 0, 0), width=1.0)
+
+        page.insert_text(fitz.Point(330, 280), "Exercise 4: Writing", fontsize=11)
+        page.insert_text(fitz.Point(330, 300), "2. Second right item:", fontsize=10)
+        page.draw_line(fitz.Point(430, 302), fitz.Point(520, 302), color=(0, 0, 0), width=1.0)
+
+        doc.save(col_pdf)
+        doc.close()
+
+        engine = HPEEngine(col_pdf, temp_dir=self.temp_dir)
+        slots = engine.detect_all_slots(page_number=1)
+        self.assertEqual(len(slots), 4)
+
+        # First 2 slots must be left column
+        self.assertEqual(slots[0]["column"], "left")
+        self.assertEqual(slots[1]["column"], "left")
+        self.assertLess(slots[0]["bbox"][0], 300)
+        self.assertLess(slots[1]["bbox"][0], 300)
+        self.assertLess(slots[0]["baseline_y"], slots[1]["baseline_y"])
+
+        # Next 2 slots must be right column
+        self.assertEqual(slots[2]["column"], "right")
+        self.assertEqual(slots[3]["column"], "right")
+        self.assertGreater(slots[2]["bbox"][0], 300)
+        self.assertGreater(slots[3]["bbox"][0], 300)
+        self.assertLess(slots[2]["baseline_y"], slots[3]["baseline_y"])
+
+    def test_header_margin_guard_advanced(self):
+        """Verifies lines at y < 85 are ignored unless accompanied by a valid question number."""
+        hm_pdf = os.path.join(self.temp_dir, "header_guard_adv.pdf")
+        doc = fitz.open()
+        page = doc.new_page(width=595, height=842)
+
+        # Spurious decorative header rule at y=60 (no question number -> must be ignored)
+        page.draw_line(fitz.Point(50, 60), fitz.Point(200, 60), color=(0, 0, 0), width=1.0)
+
+        # Spurious decorative header rule at y=75 (no question number -> must be ignored)
+        page.draw_line(fitz.Point(80, 75), fitz.Point(200, 75), color=(0, 0, 0), width=1.0)
+
+        # Valid question header line at y=75 (with question number "1." in 20pt radius -> must be kept)
+        page.insert_text(fitz.Point(385, 75), "1.", fontsize=10)
+        page.draw_line(fitz.Point(400, 76), fitz.Point(520, 76), color=(0, 0, 0), width=1.0)
+
+        # Normal question line at y=150 (must be kept)
+        page.insert_text(fitz.Point(50, 150), "2. Normal question:", fontsize=10)
+        page.draw_line(fitz.Point(150, 152), fitz.Point(300, 152), color=(0, 0, 0), width=1.0)
+
+        doc.save(hm_pdf)
+        doc.close()
+
+        engine = HPEEngine(hm_pdf, temp_dir=self.temp_dir)
+        slots = engine.detect_all_slots(page_number=1)
+
+        baselines = [s.get("baseline_y", s["bbox"][1]) for s in slots]
+        # Decorative lines at y=60 and left y=75 must not be in slots
+        self.assertFalse(any(abs(b - 60.0) < 2.0 for b in baselines), "Decorative line at y=60 must be ignored")
+        self.assertFalse(any(abs(b - 75.0) < 2.0 and s["bbox"][0] < 250 for b, s in zip(baselines, slots)), "Decorative line at y=75 without Q-number must be ignored")
+
+        # Valid lines must be kept
+        self.assertTrue(any(abs(b - 76.0) < 3.0 for b in baselines), "Line at y=76 with question number must be kept")
+        self.assertTrue(any(abs(b - 152.0) < 3.0 for b in baselines), "Line at y=152 must be kept")
+
+    def test_real_fixture_rlw_workbook(self):
+        """Tests directly on real fixture RLW_Real Life Workbook-45-46.pdf Page 1."""
+        real_pdf = "/home/zuan/CST_Assignments/scratch/RLW_Real Life Workbook-45-46.pdf"
+        if not os.path.exists(real_pdf):
+            self.skipTest(f"Fixture {real_pdf} not available")
+
+        engine = HPEEngine(real_pdf, temp_dir=self.temp_dir)
+        slots = engine.detect_all_slots(page_number=1)
+        self.assertGreater(len(slots), 10)
+
+        # Proof 1: No header lines at y=60 or y=75
+        for s in slots:
+            y = s.get("baseline_y", s["bbox"][1])
+            self.assertGreaterEqual(y, 85.0, f"Slot {s.get('tag')} has y={y} < 85.0 pt")
+
+        # Proof 2: Left column slots come first, followed by right column slots
+        saw_right = False
+        for s in slots:
+            col = s.get("column")
+            if col == "right":
+                saw_right = True
+            elif col == "left":
+                self.assertFalse(saw_right, f"Found left slot {s.get('tag')} after right column slots!")
+
 
 if __name__ == "__main__":
     unittest.main()

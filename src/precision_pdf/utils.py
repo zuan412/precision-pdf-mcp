@@ -84,10 +84,14 @@ def resolve_unicode_font(bold: bool = False) -> Optional[str]:
     else:  # Linux / Unix
         if bold:
             candidate_fonts = [
+                "/usr/share/fonts/noto/NotoSans-Bold.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
                 "/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Bold.ttf",
                 "/usr/share/fonts/abattis-cantarell-fonts/Cantarell-Bold.otf",
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
                 "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+                "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans.ttf",
                 "/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf",
                 "/usr/share/fonts/abattis-cantarell-fonts/Cantarell-Regular.otf",
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -95,6 +99,8 @@ def resolve_unicode_font(bold: bool = False) -> Optional[str]:
             ]
         else:
             candidate_fonts = [
+                "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+                "/usr/share/fonts/TTF/DejaVuSans.ttf",
                 "/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf",
                 "/usr/share/fonts/abattis-cantarell-fonts/Cantarell-Regular.otf",
                 "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -105,8 +111,21 @@ def resolve_unicode_font(bold: bool = False) -> Optional[str]:
         if os.path.isfile(font_path):
             return os.path.abspath(font_path)
 
+    # Dynamic fontconfig resolution if fc-match is available on Linux
+    if sys.platform not in ("win32", "darwin"):
+        try:
+            import subprocess
+            cmd = ["fc-match", "sans-serif:weight=bold" if bold else "sans-serif", "-f", "%{file}"]
+            p = subprocess.run(cmd, capture_output=True, text=True, timeout=1)
+            if p.returncode == 0 and p.stdout.strip() and os.path.isfile(p.stdout.strip()):
+                return os.path.abspath(p.stdout.strip())
+        except Exception:
+            pass
+
     # Cross-platform fallback check
     fallback_candidates = [
+        "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
         "/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf",
         "/usr/share/fonts/abattis-cantarell-fonts/Cantarell-Regular.otf",
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
@@ -142,6 +161,8 @@ def resolve_system_font(size: int = 11, bold: bool = False) -> ImageFont.ImageFo
         ]
     else:  # Linux / Unix
         candidate_fonts = [
+            "/usr/share/fonts/noto/NotoSans-Bold.ttf" if bold else "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/TTF/DejaVuSans.ttf",
             "/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Bold.ttf" if bold else "/usr/share/fonts/adwaita-sans-fonts/AdwaitaSans-Regular.ttf",
             "/usr/share/fonts/abattis-cantarell-fonts/Cantarell-Bold.otf" if bold else "/usr/share/fonts/abattis-cantarell-fonts/Cantarell-Regular.otf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",

@@ -44,7 +44,8 @@ def hpe_inspect_virtual_grid(pdf_path: str, page_number: int, dpi: int = 150) ->
                 "height": round(s.get("height", 0), 1),
                 "multiline_next": s.get("multiline_next", False),
                 "context": s.get("context", ""),
-                "question_hint": s.get("question_hint")
+                "question_hint": s.get("question_hint"),
+                "column": s.get("column", "single")
             }
 
         return json.dumps({

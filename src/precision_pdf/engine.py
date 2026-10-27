@@ -46,12 +46,67 @@ class HPEEngine:
             doc.close()
             raise ValueError(f"Page {page_number} out of range (1..{len(doc)})")
         page = doc[page_idx]
-        pw = page.rect.width
-        ph = page.rect.height
 
+        words = page.get_text("words")
+        sorted_words = sorted(words, key=lambda w: (round(w[1] / 8.0), w[0]))
+
+        # Extract raw candidate slots across vector, raster, and text layers with Header Margin Guard
+        raw_slots = self._extract_raw_slots(page, page_idx, words, dpi=dpi)
+
+        # Detect whether the page is formatted into multiple columns
+        split_x = self._detect_column_split(page, raw_slots)
+
+        doc.close()
+
+        # Deduplicate overlapping vector, raster, and text slots
+        filtered_slots = self._deduplicate_slots(raw_slots)
+
+        # Sort slots in column-aware natural reading order (Left col top-to-bottom, then Right col)
+        filtered_slots = self._sort_slots_column_aware(filtered_slots, split_x)
+
+        # Apply padding guard, question context extraction, and multiline grouping
+        self._apply_padding_guard(filtered_slots, sorted_words)
+        self._extract_slot_context(filtered_slots, words, split_x=split_x)
+        self._identify_multiline_groups(filtered_slots)
+
+        return filtered_slots
+
+    def _is_valid_header_slot(self, s: Dict[str, Any], words: List[Tuple]) -> bool:
+        r"""
+        Header Margin Guard:
+        Bỏ qua các đường kẻ hoặc rect có baseline_y < 85.0 pt (hoặc y0 < 85.0 pt)
+        TRỪ KHI trong bán kính 20pt có số thứ tự câu hỏi hợp lệ (regex ^\s*(\d+|[a-fA-F])[\.\)]).
+        """
+        by = s.get("baseline_y", s["bbox"][1])
+        y0 = s["bbox"][1]
+        if by >= 85.0 and y0 >= 85.0:
+            return True
+
+        bx0, by0, bx1, by1 = s["bbox"]
+        for w in words:
+            wx0, wy0, wx1, wy1, wtext = w[0], w[1], w[2], w[3], w[4]
+            dx = max(0.0, bx0 - wx1, wx0 - bx1)
+            dy = max(0.0, by0 - wy1, wy0 - by1)
+            if (dx * dx + dy * dy) <= (20.0 * 20.0):
+                if re.match(r'^\s*(\d+|[a-fA-F])[\.\)]', wtext):
+                    return True
+        return False
+
+    def _extract_raw_slots(
+        self,
+        page,
+        page_idx: int,
+        words: List[Tuple],
+        dpi: int = 144
+    ) -> List[Dict[str, Any]]:
+        """
+        Extracts candidate answer slots across vector, raster, and text layers,
+        applying the Header Margin Guard.
+        """
+        ph = page.rect.height
         raw_slots = []
 
-        # Layer 1: Vector geometry via PyMuPDF get_drawings & pdfplumber
+        # Layer 1A: Vector geometry via PyMuPDF get_drawings
         try:
             for d in page.get_drawings():
                 for it in d.get("items", []):
@@ -59,8 +114,8 @@ class HPEEngine:
                         r = it[1]
                         w = abs(r.width)
                         h = abs(r.height)
-                        if 8.0 <= w <= 500.0 and 8.0 <= h <= 100.0 and r.y0 >= 55.0:
-                            raw_slots.append({
+                        if 8.0 <= w <= 500.0 and 8.0 <= h <= 100.0:
+                            cand = {
                                 "type": "box",
                                 "source": "vector",
                                 "bbox": (float(r.x0), float(r.y0), float(r.x1), float(r.y1)),
@@ -68,10 +123,13 @@ class HPEEngine:
                                 "cy": float((r.y0 + r.y1) / 2.0),
                                 "width": float(w),
                                 "height": float(h)
-                            })
+                            }
+                            if self._is_valid_header_slot(cand, words):
+                                raw_slots.append(cand)
         except Exception as e:
             logger.debug(f"PyMuPDF vector rect extraction skipped: {e}")
 
+        # Layer 1B: Vector geometry via pdfplumber
         try:
             with pdfplumber.open(self.pdf_path) as plum:
                 p_plum = plum.pages[page_idx]
@@ -82,8 +140,8 @@ class HPEEngine:
                     w = abs(x1 - x0)
                     h = abs(y1 - y0)
                     baseline_y = float((y0 + y1) / 2.0)
-                    if h <= 2.5 and w >= 20.0 and baseline_y >= 55.0:
-                        raw_slots.append({
+                    if h <= 2.5 and 20.0 <= w < (pw * 0.82):
+                        cand = {
                             "type": "underline",
                             "source": "vector",
                             "bbox": (min(x0, x1), y0 - 10.0, max(x0, x1), y1 + 3.0),
@@ -92,15 +150,17 @@ class HPEEngine:
                             "x1": float(max(x0, x1)),
                             "width": float(w),
                             "height": float(max(h, 1.0))
-                        })
+                        }
+                        if self._is_valid_header_slot(cand, words):
+                            raw_slots.append(cand)
 
                 # Vector rectangles (boxes/table cells)
                 for rect in p_plum.rects:
                     x0, top, x1, bottom = rect["x0"], rect["top"], rect["x1"], rect["bottom"]
                     w = abs(x1 - x0)
                     h = abs(bottom - top)
-                    if 8.0 <= w <= 500.0 and 8.0 <= h <= 100.0 and top >= 55.0:
-                        raw_slots.append({
+                    if 8.0 <= w <= 500.0 and 8.0 <= h <= 100.0:
+                        cand = {
                             "type": "box",
                             "source": "vector",
                             "bbox": (float(x0), float(top), float(x1), float(bottom)),
@@ -108,29 +168,29 @@ class HPEEngine:
                             "cy": float((top + bottom) / 2.0),
                             "width": float(w),
                             "height": float(h)
-                        })
+                        }
+                        if self._is_valid_header_slot(cand, words):
+                            raw_slots.append(cand)
         except Exception as e:
             logger.debug(f"pdfplumber extraction skipped: {e}")
 
         # Layer 2: In-Memory Morphological Raster Line Scanning (NumPy)
         raster_lines = self._scan_raster_lines(page, dpi=dpi, min_width_pt=35.0)
         for rl in raster_lines:
-            if rl["y"] >= 55.0:
-                raw_slots.append({
-                    "type": "underline",
-                    "source": "raster",
-                    "bbox": (rl["x0"], rl["y"] - 12.0, rl["x1"], rl["y"] + 2.0),
-                    "baseline_y": float(rl["y"]),
-                    "x0": float(rl["x0"]),
-                    "x1": float(rl["x1"]),
-                    "width": float(rl["width"]),
-                    "height": 14.0
-                })
+            cand = {
+                "type": "underline",
+                "source": "raster",
+                "bbox": (rl["x0"], rl["y"] - 12.0, rl["x1"], rl["y"] + 2.0),
+                "baseline_y": float(rl["y"]),
+                "x0": float(rl["x0"]),
+                "x1": float(rl["x1"]),
+                "width": float(rl["width"]),
+                "height": 14.0
+            }
+            if self._is_valid_header_slot(cand, words):
+                raw_slots.append(cand)
 
         # Layer 3: Text-based underscores & gap markers via PyMuPDF
-        words = page.get_text("words")
-        sorted_words = sorted(words, key=lambda w: (round(w[1] / 8.0), w[0]))
-
         for w in words:
             text = w[4]
 
@@ -140,21 +200,25 @@ class HPEEngine:
                 total_len = len(text)
                 x_start = w[0] + (w[2] - w[0]) * (prefix_len / total_len) if total_len > 0 else w[0]
                 baseline_y = float(w[3] - 1.5)
-                if baseline_y >= 55.0:
-                    raw_slots.append({
-                        "type": "underline",
-                        "source": "text_underscore",
-                        "bbox": (float(x_start), float(w[1]), float(w[2]), float(w[3])),
-                        "baseline_y": baseline_y,
-                        "x0": float(x_start),
-                        "x1": float(w[2]),
-                        "width": float(w[2] - x_start),
-                        "height": float(w[3] - w[1])
-                    })
+                cand = {
+                    "type": "underline",
+                    "source": "text_underscore",
+                    "bbox": (float(x_start), float(w[1]), float(w[2]), float(w[3])),
+                    "baseline_y": baseline_y,
+                    "x0": float(x_start),
+                    "x1": float(w[2]),
+                    "width": float(w[2] - x_start),
+                    "height": float(w[3] - w[1])
+                }
+                if self._is_valid_header_slot(cand, words):
+                    raw_slots.append(cand)
 
             # 3B. Numbered gap markers: '1)', '2)', '(1)', '(2)', '1.'
             m_gap = re.match(r"^(\(?\d{1,2}\.?\)?)$", text)
             if m_gap and ("_" not in text):
+                # Filter out markers in bottom footer page-number margin
+                if float(w[3]) > (ph - 35.0):
+                    continue
                 # Ensure there isn't an immediate word right after (e.g. '1. What' is a question heading, not a gap)
                 has_immediate_next_word = any(
                     other[0] > w[2] and other[0] < (w[2] + 25.0) and abs(other[3] - w[3]) < 6.0
@@ -165,32 +229,87 @@ class HPEEngine:
                     gap_x0 = float(w[2] + 4.0)
                     gap_x1 = float(w[2] + 55.0)
                     baseline_y = float(w[3] - 1.5)
-                    if baseline_y >= 55.0:
-                        raw_slots.append({
-                            "type": "gap",
-                            "source": "gap_marker",
-                            "bbox": (gap_x0, float(w[1]), gap_x1, float(w[3])),
-                            "baseline_y": baseline_y,
-                            "x0": gap_x0,
-                            "x1": gap_x1,
-                            "width": float(gap_x1 - gap_x0),
-                            "height": float(w[3] - w[1]),
-                            "marker": marker
-                        })
+                    cand = {
+                        "type": "gap",
+                        "source": "gap_marker",
+                        "bbox": (gap_x0, float(w[1]), gap_x1, float(w[3])),
+                        "baseline_y": baseline_y,
+                        "x0": gap_x0,
+                        "x1": gap_x1,
+                        "width": float(gap_x1 - gap_x0),
+                        "height": float(w[3] - w[1]),
+                        "marker": marker
+                    }
+                    if self._is_valid_header_slot(cand, words):
+                        raw_slots.append(cand)
 
-        doc.close()
+        return raw_slots
 
-        # Deduplicate, apply dynamic margin guard, padding guard, semantic context, and multi-line grouping
-        filtered_slots = self._deduplicate_slots(raw_slots)
-        filtered_slots = [
-            s for s in filtered_slots
-            if s.get("baseline_y", s["bbox"][1]) >= 55.0
-        ]
-        self._apply_padding_guard(filtered_slots, sorted_words)
-        self._extract_semantic_context(filtered_slots, words)
-        self._identify_multiline_groups(filtered_slots)
+    def _detect_column_split(self, page, slots: List[Dict[str, Any]]) -> Optional[float]:
+        """
+        Automatically detects whether the page has a 2-column exercise layout based on
+        the distribution of slot coordinates and text blocks.
+        Returns the x split boundary if 2 columns are detected, else None.
+        """
+        pw = page.rect.width
+        if len(slots) < 4:
+            return None
 
-        return filtered_slots
+        slot_centers = [(s["bbox"][0] + s["bbox"][2]) / 2.0 for s in slots]
+        min_split = 0.38 * pw
+        max_split = 0.62 * pw
+
+        left_slots = [x for x in slot_centers if x < pw * 0.48]
+        right_slots = [x for x in slot_centers if x > pw * 0.52]
+
+        if len(left_slots) >= 2 and len(right_slots) >= 2:
+            blocks = [b for b in page.get_text("blocks") if b[4].strip()]
+            left_blocks = [b for b in blocks if b[2] <= pw * 0.55]
+            right_blocks = [b for b in blocks if b[0] >= pw * 0.45]
+            crossing_blocks = [b for b in blocks if b[0] < min_split and b[2] > max_split]
+
+            # In a multi-column document, the body blocks belong strictly to left or right
+            if len(left_blocks) >= 3 and len(right_blocks) >= 3 and len(crossing_blocks) <= 3:
+                max_left = max(left_slots)
+                min_right = min(right_slots)
+                if min_right > max_left:
+                    return float((max_left + min_right) / 2.0)
+                return float(pw / 2.0)
+
+        return None
+
+    def _sort_slots_column_aware(
+        self,
+        slots: List[Dict[str, Any]],
+        split_x: Optional[float]
+    ) -> List[Dict[str, Any]]:
+        """
+        Sorts slots in Natural Reading Order:
+        - If 2-column: All Left Column slots from top to bottom (Exercise 1 -> Exercise 2),
+          followed by All Right Column slots from top to bottom (Exercise 3 -> Exercise 4).
+        - If single column: Sorted top-to-bottom across the page.
+        """
+        if split_x is None:
+            for s in slots:
+                s["column"] = "single"
+            slots.sort(key=lambda s: (round(s["bbox"][1] / 14.0), s["bbox"][0]))
+            return slots
+
+        left_slots = []
+        right_slots = []
+        for s in slots:
+            x_center = (s["bbox"][0] + s["bbox"][2]) / 2.0
+            if x_center < split_x:
+                s["column"] = "left"
+                left_slots.append(s)
+            else:
+                s["column"] = "right"
+                right_slots.append(s)
+
+        left_slots.sort(key=lambda s: (round(s["bbox"][1] / 14.0), s["bbox"][0]))
+        right_slots.sort(key=lambda s: (round(s["bbox"][1] / 14.0), s["bbox"][0]))
+
+        return left_slots + right_slots
 
     def _scan_raster_lines(self, page, dpi: int = 144, min_width_pt: float = 35.0) -> List[Dict[str, float]]:
         """Scans rendered raster image for horizontal printed lines using pure NumPy morphology in RAM."""
@@ -219,6 +338,10 @@ class HPEEngine:
                     length < (pw * 0.82) and
                     x0_pt >= 35.0 and
                     x1_pt <= (pw - 25.0)):
+                    mid_x = int((s + e) / 2)
+                    y_above = max(0, y - int(3.0 * scale))
+                    if arr[y_above, mid_x] < 205:
+                        continue
                     detected_lines.append({
                         "y": y / scale,
                         "x0": x0_pt,
@@ -299,50 +422,120 @@ class HPEEngine:
                     s["width"] = new_x1 - s["x0"]
                     s["bbox"] = (s["x0"], s["bbox"][1], new_x1, s["bbox"][3])
 
-    def _extract_semantic_context(self, slots: List[Dict[str, Any]], words: List[Tuple]):
+    def _extract_slot_context(
+        self,
+        slots: List[Dict[str, Any]],
+        words: List[Tuple],
+        split_x: Optional[float] = None
+    ):
         """
-        Extracts preceding text context (up to 80 chars) and question hint
-        (e.g. '1', '2', 'A', 'B') for each detected slot within [x0 - 250pt, x0].
+        Extracts preceding question text context and question hint (e.g. '1', '2', 'A', 'B')
+        for each detected slot, respecting column boundaries to avoid cross-column pollution.
         """
+        q_pattern = re.compile(
+            r"(?:^|[\.\?\!\;\n]\s*|(?P<pfx>\b(?:Question|Câu|Bài|Part|Ex|Exercise)\s*))"
+            r"(\(?\d{1,3}[\.\:\)\-]?|\[\d{1,3}\]|\(?[a-hA-H][\.\:\)\-])"
+            r"(?=\s+[A-Za-z0-9\(\[\'\"]|\s*[\.\:\)\-]|\s*$)",
+            re.IGNORECASE
+        )
+
         for s in slots:
             slot_x0 = s["x0"] if s["type"] in ["underline", "gap"] else s["bbox"][0]
             slot_y = s.get("baseline_y") if s["type"] in ["underline", "gap"] else s.get("cy", (s["bbox"][1] + s["bbox"][3]) / 2.0)
+            col = s.get("column", "single")
 
-            # Match words on the same line preceding the slot
-            cand_words = [
-                w for w in words
-                if abs(w[3] - slot_y) <= 9.0 and (slot_x0 - 250.0) <= w[0] < slot_x0 and w[2] <= (slot_x0 + 4.0)
-            ]
-            if not cand_words:
-                # Fallback: check prompt text just above slot
-                cand_words = [
-                    w for w in words
-                    if (slot_y - 45.0) <= w[3] < (slot_y - 2.0) and (slot_x0 - 250.0) <= w[0] <= (slot_x0 + 250.0)
-                ]
-                cand_words.sort(key=lambda w: (round(w[1] / 6.0), w[0]))
+            # Constrain candidate words to the slot's column to avoid cross-column text bleeding
+            if split_x is not None:
+                if col == "left":
+                    col_words = [w for w in words if w[2] <= split_x + 6.0]
+                elif col == "right":
+                    col_words = [w for w in words if w[0] >= split_x - 6.0]
+                else:
+                    col_words = words
             else:
-                cand_words.sort(key=lambda w: w[0])
+                col_words = words
 
-            full_context = " ".join(w[4] for w in cand_words).strip()
+            # Scan words on the same line preceding the slot
+            same_line = [
+                w for w in col_words
+                if abs(w[3] - slot_y) <= 8.0 and w[2] <= (slot_x0 + 4.0)
+            ]
+            same_line.sort(key=lambda w: w[0])
+            same_text = " ".join(w[4] for w in same_line).strip()
+
+            # Scan line directly above
+            above_line1 = [
+                w for w in col_words
+                if (slot_y - 22.0) <= w[3] <= (slot_y - 7.0)
+            ]
+            above_line1.sort(key=lambda w: w[0])
+            above1_text = " ".join(w[4] for w in above_line1).strip()
+
+            # Scan 2 lines above
+            above_line2 = [
+                w for w in col_words
+                if (slot_y - 36.0) <= w[3] <= (slot_y - 18.0)
+            ]
+            above_line2.sort(key=lambda w: w[0])
+            above2_text = " ".join(w[4] for w in above_line2).strip()
 
             question_hint = None
-            if full_context:
-                m_num = re.search(r'\b(?:(?:Question|Câu|Bài|Part|Ex|Exercise)\s*)?\(?([0-9]{1,3})\)?(?:\.|\)|\:|\-|\s|$)', full_context, re.IGNORECASE)
-                if m_num:
-                    question_hint = m_num.group(1)
-                else:
-                    m_letter = re.search(r'\b([A-H])(?:\.|\)|\:|\-|\s|$)', full_context)
-                    if m_letter:
-                        question_hint = m_letter.group(1)
+            prompt_context = None
 
+            # 1. Match question number in same line
+            m_same = list(q_pattern.finditer(same_text))
+            if m_same:
+                last_m = m_same[-1]
+                question_hint = last_m.group(2).strip("().[]:- ")
+                start_idx = last_m.start("pfx") if last_m.group("pfx") else last_m.start(2)
+                prompt_context = same_text[start_idx:].strip()
+
+            # 2. Match in 1 line above if not found on same line
+            if not question_hint and above1_text:
+                m_above1 = list(q_pattern.finditer(above1_text))
+                if m_above1:
+                    last_m = m_above1[-1]
+                    question_hint = last_m.group(2).strip("().[]:- ")
+                    start_idx = last_m.start("pfx") if last_m.group("pfx") else last_m.start(2)
+                    prompt_context = (above1_text[start_idx:] + " " + same_text).strip()
+
+            # 3. Match in 2 lines above if not found
+            if not question_hint and above2_text:
+                m_above2 = list(q_pattern.finditer(above2_text))
+                if m_above2:
+                    last_m = m_above2[-1]
+                    question_hint = last_m.group(2).strip("().[]:- ")
+                    start_idx = last_m.start("pfx") if last_m.group("pfx") else last_m.start(2)
+                    prompt_context = (above2_text[start_idx:] + " " + above1_text + " " + same_text).strip()
+
+            # 4. Check explicit gap marker attribute
             if not question_hint and s.get("marker"):
-                m_marker = re.search(r'([0-9]{1,3}|[A-H])', s["marker"])
-                if m_marker:
-                    question_hint = m_marker.group(1)
+                m_mark = re.search(r"([0-9]{1,3}|[A-H])", s["marker"])
+                if m_mark:
+                    question_hint = m_mark.group(1)
 
-            context = full_context[-80:].strip() if len(full_context) > 80 else full_context
-            s["context"] = context
+            # 5. Fallback context if no question number found
+            if not prompt_context:
+                if len(same_text) < 15 and above1_text:
+                    prompt_context = (above1_text + " " + same_text).strip()
+                else:
+                    prompt_context = same_text or above1_text
+
+            # Trim to max 100 characters for clean prompt
+            if prompt_context and len(prompt_context) > 100:
+                prompt_context = prompt_context[-100:].strip()
+
+            s["context"] = prompt_context or ""
             s["question_hint"] = question_hint
+
+    def _extract_semantic_context(
+        self,
+        slots: List[Dict[str, Any]],
+        words: List[Tuple],
+        split_x: Optional[float] = None
+    ):
+        """Backward-compatible alias for _extract_slot_context."""
+        self._extract_slot_context(slots, words, split_x=split_x)
 
     def _identify_multiline_groups(self, slots: List[Dict[str, Any]]):
         """Identifies vertically stacked lines for the same question, clustered by column x."""
